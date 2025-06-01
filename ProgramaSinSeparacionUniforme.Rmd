@@ -1,0 +1,567 @@
+---
+title: "ProgramaBueno"
+author: "Ángela Paredes Gómez"
+date: "2025-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Librerías necesarias en los próximos procesos.
+
+```{r}
+#install.packages("dplyr")
+library(dplyr)
+#install.packages("lubridate")
+library(lubridate)
+#install.packages("tidyr")
+library(tidyr)
+#install.packages("purrr")
+library(purrr)
+#install.packages("ggplot2")
+library(ggplot2)
+#install.packages("dtw")
+library(dtw)
+#install.packages("dtwclust")
+library(dtwclust)
+#install.packages("cluster")
+library(cluster)
+#install.packages("doParallel")
+library(doParallel)
+#install.packages("proxy")
+library(proxy)
+#install.packages("forecast")
+library(forecast)
+#install.packages("bigmemory")
+library(bigmemory)
+```
+
+# Leemos los datos
+
+Leemos los datos de la base de datos que anteriormente hemos limpiado y que contiene las variables elegidas.
+Las variables son player_id, name, first_name, last_name, date, market_value_in_eur, position, foot, height_in_cm, country_of_birth, current_club_domestic_competition_id, current_club_name y country_of_citizenship.
+
+```{r}
+RegistrosLimpios = read.csv("C:/Users/angyp/Desktop/TFG/JugadoresLimpiosBueno.csv", sep=";", header = TRUE, dec = ".")
+```
+
+Cambiamos el formato de la columna "date" a una fecha que acepte correctamente R.
+
+```{r}
+RegistrosLimpios$date <- as.Date(RegistrosLimpios$date, format = "%d/%m/%Y")
+```
+
+
+# Preparación de los datos
+
+Ahora realizamos el modelo sin separación temporal uniforme.
+
+# Sin separación semestral
+
+Creamos una lista con los valores de mercado de cada jugador.
+
+```{r}
+DatosSeriesSinFecha <- RegistrosLimpios
+
+SeriesJugadorSinNormalizarSinFecha <- DatosSeriesSinFecha %>%
+  group_by(player_id) %>%
+  summarise(serie = list(market_value_in_eur),
+            .groups = "drop") %>%
+  pull(serie)
+```
+
+Creamos una lista con los identificadores de los jugadores en el mismo orden que la lista de sus valores, para poder identificar los jugadores por su posición en la lista.
+
+```{r}
+idsSinFecha <- DatosSeriesSinFecha %>%
+  distinct(player_id) %>%
+  pull(player_id) %>%
+  as.list()
+```
+
+Normalizamos los datos del valor de mercado de los jugadores, debido a que queremos comparar las formas de las series temporales sin tener en cuenta las magnitudes.
+
+```{r}
+SeriesJugadorSinFecha <- zscore(SeriesJugadorSinNormalizarSinFecha)
+```
+
+Dividimos los datos en entrenamiento y validación de manera aleatoria. Solo separamos 5 jugadores del conjunto total para el conjunto de validación, los cuales vamos a usar después para agruparlos al grupo cuya distancia DTW al medoide del grupo sea menor y analizar las alineaciones y distancias. También dividimos los ids de los jugadores con los mismos índices para poder identificar los jugadores.
+
+```{r}
+set.seed(321)
+
+n_sin_fecha <- length(SeriesJugadorSinFecha)
+
+indices_sin_fecha <- sample(1:n_sin_fecha)
+
+n_train_sin_fecha <- floor(0.998878 * n_sin_fecha)
+n_val_sin_fecha <- floor(0.001123 * n_sin_fecha)
+
+indices_train_sin_fecha <- indices_sin_fecha[1:n_train_sin_fecha]
+indices_val_sin_fecha <- indices_sin_fecha[(n_train_sin_fecha + 1):(n_train_sin_fecha + n_val_sin_fecha)]
+
+
+TrainSet_sin_fecha <- SeriesJugadorSinFecha[indices_train_sin_fecha]
+ValSet_sin_fecha <- SeriesJugadorSinFecha[indices_val_sin_fecha]
+
+idsTrainSet_sin_fecha <- idsSinFecha[indices_train_sin_fecha]
+idsValSet_sin_fecha <- idsSinFecha[indices_val_sin_fecha]
+
+cat("Jugadores en train:", length(TrainSet_sin_fecha),
+    "Jugadores en validation:", length(ValSet_sin_fecha),"\n")
+
+```
+
+Realizamos la regla del codo para ver cual es el mejor número de clúster para el método de agrupamiento particional. Para hacer la regla del codo realizamos el agrupamiento con diferentes números de clústeres y calculamos para cada iteración la suma de las distancias de cada serie temporal a su medoide correspondiente. En el momento en el que esta suma deja de disminuir de manera considerable, se considera el mejor número de clústeres.
+
+```{r}
+TrainIndicesMuestra_sin_fecha <- indices_train_sin_fecha
+
+TrainMuestra_sin_fecha <- SeriesJugadorSinFecha[TrainIndicesMuestra_sin_fecha]
+
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+codo2 <- function(data, clusterMax) {
+  distancias <- numeric(clusterMax - 1)
+  for(k in 2:clusterMax) {
+    clustering <- tsclust(data, type = "partitional", k = k, distance = "dtw", centroid = "pam", control = partitional_control(),args = tsclust_args(dist = list(window.size = 5)), seed = 42)
+    distancia <- clustering@cldist
+    distancias[k-1] <- sum(distancia)
+  }
+  
+  DatosCodo <- data.frame(k = 2:clusterMax, dis = distancias)
+  ggplot(DatosCodo, aes(x = k, y = dis)) + geom_line() + geom_point() +
+    labs(x = "Número de clusters (k)", y = "Suma de distancias DTW",
+         title = "Método del codo para determinar el mejor número de clusters") + theme_minimal() +
+    scale_x_continuous(breaks = 2:clusterMax)
+}
+
+codo2(TrainMuestra_sin_fecha, clusterMax = 15)
+```
+
+Hacemos el agrupamiento particional con el número de grupos que hemos elegido del método del codo, usando la distancia DTW con una restricción de ventana para acelerar el proceso y usando como método de agrupamiento PAM (partitioning around medoids). Graficamos los grupos y los centroides.
+
+```{r}
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+cluster_sin_fechas8 <- tsclust(TrainSet_sin_fecha, type = "partitional", k = 8, distance = "dtw", centroid = "pam", control = partitional_control(),args = tsclust_args(dist = list(window.size = 5)), seed = 12345)
+
+plot(cluster_sin_fechas8, type = "sc")
+plot(cluster_sin_fechas8, type = "centroids")
+```
+
+Calculamos el índice de silhouette para ver la calidad del agrupamiento particional con ocho grupos.
+
+```{r}
+cvi_valores_sin_fecha_8grupos <- cvi(cluster_sin_fechas8)
+cvi_valores_sin_fecha_8grupos
+```
+
+Hacemos el agrupamiento particional ahora con cuatro grupos, para compararlo con el de ocho, usando la distancia DTW con una restricción de ventana para acelerar el proceso y usando como método de agrupamiento PAM (partitioning around medoids). Graficamos los grupos y los centroides.
+
+```{r}
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+cluster_sin_fechas4 <- tsclust(TrainSet_sin_fecha, type = "partitional", k = 4 , distance = "dtw", centroid = "pam", control = partitional_control(),args = tsclust_args(dist = list(window.size = 5)), seed = 12345)
+
+plot(cluster_sin_fechas4, type = "sc")
+plot(cluster_sin_fechas4, type = "centroids")
+```
+
+Calculamos el índice de silhouette para ver la calidad de este agrupamiento.
+
+```{r}
+cvi_valores_sin_fecha_4grupos <- cvi(cluster_sin_fechas4)
+cvi_valores_sin_fecha_4grupos
+```
+
+Para las series del conjunto de validación, vemos cual sería el grupo al que pertenecen midiendo su similitud a los medoides de los grupos y eligiendo aquel cuya distancia DTW sea menor. Representamos la serie del jugador junto al centroide del grupo y la alineación entre ambos para analizarlo.
+
+Serie 1
+
+```{r}
+id_jugador1 <- idsValSet_sin_fecha[1]
+
+nombre_jugador1 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador1, "first_name"]))
+
+apellido_jugador1 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador1, "last_name"]))
+
+cat("El primer jugador es", nombre_jugador1, apellido_jugador1)
+```
+
+
+```{r}
+ValSetPrueba_sin_fecha_serie1 <- ValSet_sin_fecha[[1]]
+ValSetPrueba_sin_fecha1 <- list(ts(ValSetPrueba_sin_fecha_serie1))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha1 <- proxy::dist(ValSetPrueba_sin_fecha1, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha1 <- which.min(disVal_sin_fecha1)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha1), "\n") 
+
+v1 <- ValSetPrueba_sin_fecha_serie1
+v2 <- cluster_sin_fechas8@centroids[[cluster_asignado_sin_fecha1]]
+
+xrange <- range(1:max(length(v1),length(v2)))
+yrange <- range(c(v1,v2))
+
+plot(xrange, yrange, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1, col='blue', type='l')
+lines(v2, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw1 <- dtw(v1,v2, keep = TRUE, window.type = "sakoechiba", window.size = 5)
+dis_dtw1$index1
+dis_dtw1$index2
+
+plot(dis_dtw1, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw1, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie1 <-  disVal_sin_fecha1[[cluster_asignado_sin_fecha1]]
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie1))
+
+```
+
+Serie 2
+
+```{r}
+id_jugador2 <- idsValSet_sin_fecha[2]
+
+nombre_jugador2 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador2, "first_name"]))
+
+apellido_jugador2 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador2, "last_name"]))
+
+cat("El segundo jugador es", nombre_jugador2, apellido_jugador2)
+```
+
+```{r}
+ValSetPrueba_sin_fecha_serie2 <- ValSet_sin_fecha[[2]]
+ValSetPrueba_sin_fecha2 <- list(ts(ValSetPrueba_sin_fecha_serie2))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha2 <- proxy::dist(ValSetPrueba_sin_fecha2, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha2 <- which.min(disVal_sin_fecha2)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha2), "\n") 
+
+v1_2 <- ValSetPrueba_sin_fecha_serie2
+v2_2 <- cluster_sin_fechas8@centroids[[cluster_asignado_sin_fecha2]]
+
+xrange2 <- range(1:max(length(v1_2),length(v2_2)))
+yrange2 <- range(c(v1_2,v2_2))
+
+plot(xrange2, yrange2, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1_2, col='blue', type='l')
+lines(v2_2, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw2 <- dtw(v1_2,v2_2, keep = TRUE, window.type = "sakoechiba", window.size = 11)
+dis_dtw2$index1
+dis_dtw2$index2
+
+plot(dis_dtw2, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw2, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie2 <-  disVal_sin_fecha2[[cluster_asignado_sin_fecha2]]
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie2))
+
+```
+
+Serie 3
+
+```{r}
+id_jugador3 <- idsValSet_sin_fecha[3]
+
+nombre_jugador3 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador3, "first_name"]))
+
+apellido_jugador3 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador3, "last_name"]))
+
+cat("El tercer jugador es", nombre_jugador3, apellido_jugador3)
+```
+
+```{r}
+ValSetPrueba_sin_fecha_serie3 <- ValSet_sin_fecha[[3]]
+ValSetPrueba_sin_fecha3 <- list(ts(ValSetPrueba_sin_fecha_serie3))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha3 <- proxy::dist(ValSetPrueba_sin_fecha3, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha3 <- which.min(disVal_sin_fecha3)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha3), "\n") 
+
+v1_3 <- ValSetPrueba_sin_fecha_serie3
+v2_3 <- cluster_sin_fechas8@centroids[[cluster_asignado_sin_fecha3]]
+
+xrange3 <- range(1:max(length(v1_3),length(v2_3)))
+yrange3 <- range(c(v1_3,v2_3))
+
+plot(xrange3, yrange3, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1_3, col='blue', type='l')
+lines(v2_3, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw3 <- dtw(v1_3,v2_3, keep = TRUE, window.type = "sakoechiba", window.size = 5)
+dis_dtw3$index1
+dis_dtw3$index2
+
+plot(dis_dtw3, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw3, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie3 <-  disVal_sin_fecha3[[cluster_asignado_sin_fecha3]]
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie3))
+
+```
+
+Serie 4
+
+```{r}
+id_jugador4 <- idsValSet_sin_fecha[4]
+
+nombre_jugador4 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador4, "first_name"]))
+
+apellido_jugador4 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador4, "last_name"]))
+
+cat("El cuarto jugador es", nombre_jugador4, apellido_jugador4)
+```
+
+```{r}
+ValSetPrueba_sin_fecha_serie4 <- ValSet_sin_fecha[[4]]
+ValSetPrueba_sin_fecha4 <- list(ts(ValSetPrueba_sin_fecha_serie4))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha4 <- proxy::dist(ValSetPrueba_sin_fecha4, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha4 <- which.min(disVal_sin_fecha4)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha4), "\n") 
+
+v1_4 <- ValSetPrueba_sin_fecha_serie4
+v2_4 <- cluster_sin_fechas8@centroids[[cluster_asignado_sin_fecha4]]
+
+xrange4 <- range(1:max(length(v1_4),length(v2_4)))
+yrange4 <- range(c(v1_4,v2_4))
+
+plot(xrange4, yrange4, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1_4, col='blue', type='l')
+lines(v2_4, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw4 <- dtw(v1_4,v2_4, keep = TRUE, window.type = "sakoechiba", window.size = 5)
+dis_dtw4$index1
+dis_dtw4$index2
+
+plot(dis_dtw4, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw4, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie4 <-  disVal_sin_fecha4[[cluster_asignado_sin_fecha4]]
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie4))
+
+```
+
+Serie 5
+
+```{r}
+id_jugador5 <- idsValSet_sin_fecha[5]
+
+nombre_jugador5 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador5, "first_name"]))
+
+apellido_jugador5 <- as.character(unique(RegistrosLimpios[RegistrosLimpios$player_id == id_jugador5, "last_name"]))
+
+cat("El quinto jugador es", nombre_jugador5, apellido_jugador5)
+```
+
+```{r}
+ValSetPrueba_sin_fecha_serie5 <- ValSet_sin_fecha[[5]]
+ValSetPrueba_sin_fecha5 <- list(ts(ValSetPrueba_sin_fecha_serie5))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha5 <- proxy::dist(ValSetPrueba_sin_fecha5, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha5 <- which.min(disVal_sin_fecha5)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha5), "\n") 
+
+v1_5 <- ValSetPrueba_sin_fecha_serie5
+v2_5 <- cluster_sin_fechas8@centroids[[cluster_asignado_sin_fecha5]]
+
+xrange5 <- range(1:max(length(v1_5),length(v2_5)))
+yrange5 <- range(c(v1_5,v2_5))
+
+plot(xrange5, yrange5, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1_5, col='blue', type='l')
+lines(v2_5, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw5 <- dtw(v1_5,v2_5, keep = TRUE, window.type = "sakoechiba", window.size = 20)
+dis_dtw5$index1
+dis_dtw5$index2
+
+plot(dis_dtw5, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw5, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie5 <-  disVal_sin_fecha5[[cluster_asignado_sin_fecha5]]
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie5))
+
+```
+
+Serie cinco asignada a otro grupo para estudiar su alineación.
+
+```{r}
+ValSetPrueba_sin_fecha_serie6 <- ValSet_sin_fecha[[5]]
+ValSetPrueba_sin_fecha6 <- list(ts(ValSetPrueba_sin_fecha_serie6))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha6 <- proxy::dist(ValSetPrueba_sin_fecha6, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha6 <- 3
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha6), "\n") 
+
+v1_6 <- ValSetPrueba_sin_fecha_serie6
+v2_6 <- cluster_sin_fechas8@centroids[[3]]
+
+xrange6 <- range(1:max(length(v1_6),length(v2_6)))
+yrange6 <- range(c(v1_6,v2_6))
+
+plot(xrange6, yrange6, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1_6, col='blue', type='l')
+lines(v2_6, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw6 <- dtw(v1_6,v2_6, keep = TRUE, window.type = "sakoechiba", window.size = 20)
+dis_dtw6$index1
+dis_dtw6$index2
+
+plot(dis_dtw6, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw6, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie6 <-  disVal_sin_fecha6[[cluster_asignado_sin_fecha6]]# proxy::dist(list(v1_6), list(v2_6), method = "dtw")
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie6))
+
+```
+
+Añadimos los datos de mercado de los jugadores de fútbol Rodri y Vinicius Junior para analizar cómo serían sus agrupamientos. De la misma manera que antes, creamos una lista con sus datos y los normalizamos.
+
+```{r}
+JugadoresAdicionales = read.csv("C:/Users/angyp/Desktop/TFG/JugadoresAdicionales.csv", sep=";", header = TRUE, dec = ".")
+```
+
+Cambiamos el formato de la columna "date" a una fecha que acepte correctamente R.
+
+```{r}
+JugadoresAdicionales$date <- as.Date(JugadoresAdicionales$date, format = "%d/%m/%Y")
+```
+
+Creamos una lista con los valores de mercado de cada uno de estos jugadores.
+
+```{r}
+
+SeriesJugadorAdicional_sin_fecha_sinN <- JugadoresAdicionales %>%
+  group_by(player_id) %>%
+  summarise(serie = list(market_value_in_eur),
+            .groups = "drop") %>%
+  pull(serie)
+
+```
+
+Creamos una lista con los identificadores de los jugadores en el mismo orden que la lista de sus valores, para poder identificar los jugadores por su posición en la lista.
+
+```{r}
+idsSinFechaAdicional <- JugadoresAdicionales %>%
+  distinct(player_id) %>%
+  pull(player_id) %>%
+  as.list()
+```
+
+Normalizamos los datos del valor de mercado de los jugadores, para compararlos con los datos de los grupos formados los cuales también están normalizados.
+
+```{r}
+SeriesJugadorAdicional_sin_fecha <- zscore(SeriesJugadorAdicional_sin_fecha_sinN)
+```
+
+Vemos cual sería el grupo al que pertenece Vinicius Junior midiendo su similitud a los medoides de los grupos y eligiendo aquel cuya distancia DTW sea menor. Representamos la serie del jugador junto al centroide del grupo y la alineación entre ambos para analizarlo.
+
+Serie 8
+
+```{r}
+id_jugador8a <- idsSinFechaAdicional[2]
+
+nombre_jugador8a <- as.character(unique(JugadoresAdicionales[JugadoresAdicionales$player_id == id_jugador8a, "first_name"]))
+
+apellido_jugador8a <- as.character(unique(JugadoresAdicionales[JugadoresAdicionales$player_id == id_jugador8a, "last_name"]))
+
+equipo_jugador8a <- as.character(unique(JugadoresAdicionales[JugadoresAdicionales$player_id == id_jugador8a, "current_club_name"]))
+equipo_jugador8a
+
+cat("El octavo jugador es", apellido_jugador8a)
+```
+
+```{r}
+ValSetPrueba_sin_fecha_serie7 <- SeriesJugadorAdicional_sin_fecha[[2]]
+ValSetPrueba_sin_fecha7 <- list(ts(ValSetPrueba_sin_fecha_serie7))
+
+#Distancia DTW entre la serie y los centroides
+disVal_sin_fecha7 <- proxy::dist(ValSetPrueba_sin_fecha7, cluster_sin_fechas8@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado_sin_fecha7 <- which.min(disVal_sin_fecha7)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado_sin_fecha6), "\n") 
+
+v1_7 <- ValSetPrueba_sin_fecha_serie7
+v2_7 <- cluster_sin_fechas8@centroids[[cluster_asignado_sin_fecha7]]
+
+xrange7 <- range(1:max(length(v1_7),length(v2_7)))
+yrange7 <- range(c(v1_7,v2_7))
+
+plot(xrange7, yrange7, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(v1_7, col='blue', type='l')
+lines(v2_7, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+dis_dtw7 <- dtw(v1_7,v2_7, keep = TRUE, window.type = "sakoechiba", window.size = 20)
+dis_dtw7$index1
+dis_dtw7$index2
+
+plot(dis_dtw7, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(dis_dtw7, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disVal_serie7 <-  disVal_sin_fecha7[[cluster_asignado_sin_fecha7]]
+
+cat("La distancia entre las series es:", as.numeric(disVal_serie7))
+
+```
+
+

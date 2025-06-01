@@ -1,0 +1,877 @@
+---
+title: "ProgramaComentado"
+author: "Ángela Paredes Gómez"
+date: "2025-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Librerías necesarias en los próximos procesos.
+
+```{r}
+#install.packages("dplyr")
+library(dplyr)
+#install.packages("lubridate")
+library(lubridate)
+#install.packages("tidyr")
+library(tidyr)
+#install.packages("purrr")
+library(purrr)
+#install.packages("ggplot2")
+library(ggplot2)
+#install.packages("dtw")
+library(dtw)
+#install.packages("dtwclust")
+library(dtwclust)
+#install.packages("cluster")
+library(cluster)
+#install.packages("doParallel")
+library(doParallel)
+#install.packages("proxy")
+library(proxy)
+#install.packages("forecast")
+library(forecast)
+#install.packages("bigmemory")
+library(bigmemory)
+```
+
+# Leemos los datos
+
+Leemos los datos de la base de datos que anteriormente hemos limpiado y que contiene las variables elegidas.
+Las variables son player_id, name, first_name, last_name, date, market_value_in_eur, position, foot, height_in_cm, country_of_birth, current_club_domestic_competition_id, current_club_name y country_of_citizenship.
+
+```{r}
+RegistrosLimpios = read.csv("C:/Users/angyp/Desktop/TFG/JugadoresLimpiosBueno.csv", sep=";", header = TRUE, dec = ".")
+```
+
+Cambiamos el formato de la columna "date" a una fecha que acepte correctamente R.
+
+```{r}
+RegistrosLimpios$date <- as.Date(RegistrosLimpios$date, format = "%d/%m/%Y")
+```
+
+
+# Preparación de los datos
+
+Hemos realizado dos diferentes modelos con diferentes enfoques, el primero con igual separación temporal y el segundo con las fechas de valoración sin modificar.
+
+
+Comenzamos con el de igual separación temporal. Como cada jugador está valorado a diferentes tiempos, hemos decidido partir cada año en semestres y poner una valoración en cada semestre desde el primer registro de valoración hasta el último. De esta manera la separación temporal es igual en cada jugador. Si en un semestre del año algún jugador tiene más de un valor, se realizará la media de dichos valores, y en caso de que haya algún semestre que no tenga valor, se le pondrá el valor anterior, ya que se asume que su valor no ha cambiado.
+
+# Con separación semestral
+
+Creamos dos columnas nuevas, una de año y otra de semestre para indicar la fecha en la que la valoración fue realizada de manera semestral. La columna semestre es "1" si la valoración se hizo en el primer semestre del año (enero - junio) y "2" si se realizó en el segundo (julio - diciembre).
+En la variable del valor de mercado, por semestre hacemos la media de los valores que tengamos y en el resto de variables al ser constantes nos quedamos con la primera aparición.
+
+```{r}
+DatosSemestre <- RegistrosLimpios %>%
+  mutate(years = year(RegistrosLimpios$date),
+         semester = if_else(month(RegistrosLimpios$date) <= 6, 1, 2)) %>%
+  group_by(player_id, years, semester) %>%
+  summarise(market_value_in_eur = mean(market_value_in_eur),
+            name = first(first_name),
+            first_name = first(first_name),
+            last_name = first(last_name),
+            position = first(position),
+            foot = first(foot),
+            height_in_cm = first(height_in_cm),
+            country_of_birth = first(country_of_birth),
+            current_club_domestic_competition_id = first(current_club_domestic_competition_id),
+            current_club_name = first(current_club_name),
+            country_of_citizenship = first(country_of_citizenship),
+            .groups = "drop")
+
+```
+
+Creamos una tabla con todas las combinaciones posibles de "player_id", "years" y "semester" para añadir los valores faltantes a la tabla de datos y tener la separación correcta en las series temporales.
+
+```{r}
+TodosAnos <- DatosSemestre %>%
+  group_by(player_id) %>%
+  summarise(MenorAno = min(years), 
+            MayorAno = max(years),
+            .groups = "drop") %>%
+  rowwise() %>%
+  mutate(yearsPosibles = list(MenorAno:MayorAno)) %>%
+  unnest(yearsPosibles) %>%
+  select(player_id, years = yearsPosibles)
+
+# Vemos cual es la fecha de inicio de cada jugador para ver si alguna valoración comenzó en un segundo semestre y eliminarle el primero. Lo mismo para el final.
+
+InicioFinSemestre <- DatosSemestre %>%
+  group_by(player_id) %>%
+  summarise(MenorAno = min(years),
+            PrimerSemestre = first(semester),
+            MayorAno = max(years),
+            UltimoSemestre = last(semester),
+            .groups = "drop")
+
+TodosSemestres <- TodosAnos %>%
+  crossing(semester = c(1,2)) %>%
+  left_join(InicioFinSemestre, by = "player_id") %>%
+  filter(!(years == MenorAno & semester < PrimerSemestre),
+         !(years == MayorAno & semester > UltimoSemestre)) %>%
+  select(player_id, years, semester)
+```
+
+Unimos ambas tablas con un "left join", la creada con todos los años y semestres y la de los datos de los jugadores. Añadimos los valores faltantes rellenando de los valores anteriores.
+
+```{r}
+
+DatosTodosSemestres <- TodosSemestres %>%
+  left_join(DatosSemestre, by = c("player_id", "years", "semester")) %>%
+  arrange(player_id, years, semester) %>%
+  group_by(player_id) %>%
+  fill(market_value_in_eur, name, first_name, last_name, position, foot, height_in_cm, country_of_birth, current_club_domestic_competition_id, current_club_name, country_of_citizenship, .direction = "down") %>%
+  fill(market_value_in_eur, name, first_name, last_name, position, foot, height_in_cm, country_of_birth, current_club_domestic_competition_id, current_club_name, country_of_citizenship, .direction = "up") %>%
+  ungroup()
+
+```
+
+Leemos los datos del archivo "appearances" para poder añadir a nuestro conjunto de datos las variables con referencia a los goles, asistencias y minutos jugados de cada jugador en cada semestre para el análisis exploratorio de datos.
+
+```{r}
+appearances = read.csv("C:/Users/angyp/Desktop/TFG/appearances.csv", sep = ",", header = TRUE, dec = ".")
+```
+
+Cambiamos el formato de la columna "date" a una fecha que acepte correctamente R.
+
+```{r}
+appearances$date <- as.Date(appearances$date)
+```
+
+Al igual que antes, por semestre y por cada jugador, calculamos la media y la suma de goles, asistencias y minutos jugados.
+
+```{r}
+EstadisticasResumidas <- appearances %>%
+  mutate(
+    years = year(appearances$date),
+    semester = if_else(month(appearances$date) <= 6, 1, 2)
+  ) %>%
+  group_by(player_id, years, semester) %>%
+  summarise(
+    sum_goals = sum(goals),
+    mean_goals = mean(goals),
+    sum_assists = sum(assists),
+    mean_assists = mean(assists),
+    sum_minutes_played = sum(minutes_played),
+    mean_minutes_played = mean(minutes_played),
+    .groups = "drop"
+  )
+```
+
+Añadimos a la tabla con todos los datos las estadísticas anteriores realizando una unión de tablas. Reemplazamos los vacíos por cero para evitar errores en los cálculos.
+
+```{r}
+DatosFinal <- DatosTodosSemestres %>%
+  left_join(EstadisticasResumidas, by = c("player_id", "years", "semester")) %>%
+  mutate(
+    across(
+      c(sum_goals, mean_goals, sum_assists, mean_assists, sum_minutes_played, mean_minutes_played),
+      ~ replace_na(., 0)
+    )
+  )
+```
+
+# Análisis exploratorio de datos
+
+Agrupamos los datos por jugador para realizar el análisis exploratorio de datos de las variables cualitativas sin tener repeticiones de jugador. Además calculamos la media y la suma del valor de mercado de cada jugador para comparar cada variable con su valor.
+
+```{r}
+analisis <- DatosTodosSemestres %>%
+  group_by(player_id) %>%
+  summarise(
+    valor_medio = mean(market_value_in_eur),
+    valor_total = sum(market_value_in_eur),
+    nombre = first(name),
+    posicion = first(position),
+    pie = first(foot),
+    altura = first(height_in_cm),
+    pais_nacimiento = first(country_of_birth),
+    id_competicion = first(current_club_domestic_competition_id),
+    club = first(current_club_name),
+    nacionalidad = first(country_of_citizenship),
+  )
+```
+
+Realizamos un resumen de los datos.
+
+```{r}
+summary(DatosFinal)
+```
+
+Calculamos la correlación de los datos de las variables cuantitativas.
+
+```{r}
+cor(DatosFinal[,c(4,15:20)])
+
+pairs(DatosFinal[,c(4,15:20)])
+```
+
+```{r}
+cor(analisis[,c(2,3,7)])
+```
+
+Importamos las tablas necesarias para el análisis exploratorio de datos en PowerBI.
+```{r}
+#write.csv2(analisis, "C:/Users/angyp/Desktop/TFG/analisis20registros4000Bueno.csv", row.names = FALSE)
+#write.csv2(DatosFinal, "C:/Users/angyp/Desktop/TFG/analisisEstadisticas4000Bueno.csv", row.names = FALSE)
+```
+
+# Agrupamiento de series usando la distancia Dynamic Time Warping
+
+Creamos una nueva variable a la tabla de datos que una el año y el semestre.
+
+```{r}
+DatosSeries <- DatosFinal %>%
+  mutate(tiempo = paste0(years, ".", semester)) %>%
+  arrange(player_id, years, semester)
+```
+
+Creamos una lista con los valores de mercado de cada jugador.
+
+```{r}
+SeriesJugadorSinNormalizar <- DatosSeries %>%
+  group_by(player_id) %>%
+  summarise(serie = list(market_value_in_eur),
+            .groups = "drop") %>%
+  pull(serie)
+```
+
+Creamos una lista con los identificadores de los jugadores en el mismo orden que la lista de sus valores, para poder identificar los jugadores por su posición en la lista.
+
+```{r}
+ids <- DatosSeries %>%
+  distinct(player_id) %>%
+  pull(player_id) %>%
+  as.list()
+```
+
+Al igual que con los ids creamos una lista con las fechas de las valoraciones de cada jugador. Lo hacemos a partir de la nueva variable creada que tiene el año y mes de valoración.
+
+```{r}
+FechaSeries <- DatosSeries %>%
+  group_by(player_id) %>%
+  summarise(tiempo = list(tiempo),
+            .groups = "drop") %>%
+  pull(tiempo)
+```
+
+Normalizamos los datos del valor de mercado de los jugadores, debido a que queremos comparar las formas de las series temporales sin tener en cuenta las magnitudes.
+
+```{r}
+SeriesJugador <- zscore(SeriesJugadorSinNormalizar)
+```
+
+Dividimos los datos en entrenamiento y validación de manera aleatoria. Solo separamos 5 jugadores del conjunto total para el conjunto de validación, los cuales vamos a usar después para agruparlos al grupo cuya distancia DTW al medoide del grupo sea menor y analizar las alineaciones y distancias. También dividimos los ids de los jugadores con los mismos índices para poder identificar los jugadores.
+
+```{r}
+set.seed(321)
+
+n <- length(SeriesJugador)
+
+indices <- sample(1:n)
+
+n_train <- floor(0.998878 * n)
+n_val <- floor(0.001123 * n)
+
+indices_train <- indices[1:n_train]
+indices_val <- indices[(n_train + 1):(n_train + n_val)]
+
+TrainSet <- SeriesJugador[indices_train]
+ValSet <- SeriesJugador[indices_val]
+
+idsTrainSet <- ids[indices_train]
+idsValSet <- ids[indices_val]
+
+cat("Jugadores en train:", length(TrainSet),
+    "Jugadores en validation:", length(ValSet), "\n")
+
+```
+
+Realizamos un clúster jerárquico usando la distancia DTW y representamos el dendrograma resultante, así como una tabla resumen de los grupos.
+
+```{r}
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+clusterJer <- tsclust(TrainSet, type = "hierarchical", k = 6, distance = "dtw", args = tsclust_args(dist = list(window.size = 5)), seed = 12345)
+
+plot(clusterJer, type = "dendrogram")
+
+table(clusterJer@cluster)
+
+```
+
+Calculamos el índice de silhouette para ver la calidad de este agrupamiento.
+
+```{r}
+disSilJer <- proxy::dist(TrainSet, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+silJer <- silhouette(clusterJer@cluster, disSilJer)
+summary(silJer)
+plot(silJer, main = "Gráfico de silhouette")
+```
+
+Realizamos la regla del codo para ver cual es el mejor número de clúster para el método de agrupamiento particional. Para hacer la regla del codo realizamos el agrupamiento con diferentes números de clústeres y calculamos para cada iteración la suma de las distancias de cada serie temporal a su medoide correspondiente. En el momento en el que esta suma deja de disminuir de manera considerable, se considera el mejor número de clústeres.
+
+```{r}
+TrainIndicesMuestra <- indices_train
+
+TrainMuestra <- SeriesJugador[TrainIndicesMuestra]
+
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+codo <- function(data, clusterMax) {
+  distancias <- numeric(clusterMax - 1)
+  for(k in 2:clusterMax) {
+    clustering <- tsclust(data, type = "partitional", k = k, distance = "dtw", centroid = "pam", control = partitional_control(),args = tsclust_args(dist = list(window.size = 5)), seed = 42)
+    distancia <- clustering@cldist
+    distancias[k-1] <- sum(distancia)
+  }
+  
+  DatosCodo <- data.frame(k = 2:clusterMax, dis = distancias)
+  ggplot(DatosCodo, aes(x = k, y = dis)) + geom_line() + geom_point() +
+    labs(x = "Número de clusters (k)", y = "Suma de distancias DTW",
+         title = "Método del codo para determinar el mejor número de clusters") + theme_minimal() +
+    scale_x_continuous(breaks = 2:clusterMax)
+}
+
+codo(TrainMuestra, clusterMax = 15)
+```
+
+Hacemos el agrupamiento particional con el número de grupos que hemos elegido del método del codo, usando la distancia DTW con una restricción de ventana para acelerar el proceso y usando como método de agrupamiento PAM (partitioning around medoids). Graficamos los grupos y los centroides.
+
+```{r}
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+clusterPar <- tsclust(TrainSet, type = "partitional", k = 8, distance = "dtw", centroid = "pam", control = partitional_control(), args = tsclust_args(dist = list(window.size = 5)), seed = 12345)
+
+plot(clusterPar, type = "sc")
+plot(clusterPar, type = "centroids")
+
+```
+
+Calculamos el índice de silhouette para ver la calidad del agrupamiento particional con ocho grupos.
+
+```{r}
+cvi_valores <- cvi(clusterPar)
+cvi_valores
+```
+
+Hacemos el agrupamiento particional ahora con cuatro grupos, para compararlo con el de ocho, usando la distancia DTW con una restricción de ventana para acelerar el proceso y usando como método de agrupamiento PAM (partitioning around medoids). Graficamos los grupos y los centroides.
+
+```{r}
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+clusterPar4 <- tsclust(TrainSet, type = "partitional", k = 4, distance = "dtw", centroid = "pam", control = partitional_control(), args = tsclust_args(dist = list(window.size = 5)), seed = 12345)
+
+plot(clusterPar4, type = "sc")
+plot(clusterPar4, type = "centroids")
+
+```
+
+Calculamos el índice de silhouette para ver la calidad de este agrupamiento.
+
+```{r}
+cvi_valores_4g <- cvi(clusterPar4)
+cvi_valores_4g
+```
+
+Elegimos el modelo de agrupamiento con ocho grupos.
+
+Para las series del conjunto de validación, vemos cual sería el grupo al que pertenecen midiendo su similitud a los medoides de los grupos y eligiendo aquel cuya distancia DTW sea menor. Representamos la serie del jugador junto al centroide del grupo y la alineación entre ambos para analizarlo.
+
+Serie 1
+
+```{r}
+id_jugador1a <- idsValSet[1]
+
+nombre_jugador1a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador1a, "first_name"]))
+
+apellido_jugador1a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador1a, "last_name"]))
+
+equipo_jugador1a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador1a, "current_club_name"]))
+equipo_jugador1a
+
+cat("El primer jugador es",nombre_jugador1a, apellido_jugador1a)
+```
+
+```{r}
+ValSetPrueba_serie1 <- ValSet[[1]]
+ValSetPrueba1 <- list(ts(ValSetPrueba_serie1))
+
+#Distancia DTW entre la serie y los centroides
+disVal1 <- proxy::dist(ValSetPrueba1, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado1 <- which.min(disVal1)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado1), "\n") 
+
+s1 <- ValSetPrueba_serie1
+s2 <- clusterPar@centroids[[cluster_asignado1]]
+
+xrange_1 <- range(1:max(length(s1),length(s2)))
+yrange_1 <- range(c(s1,s2))
+
+plot(xrange_1, yrange_1, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1, col='blue', type='l')
+lines(s2, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw1 <- dtw(s1,s2, keep = TRUE, window.type = "sakoechiba", window.size = 11)
+disDtw1$index1
+disDtw1$index2
+
+plot(disDtw1, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw1, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie1 <-  disVal1[[cluster_asignado1]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie1))
+
+```
+
+Serie 2
+
+```{r}
+id_jugador2a <- idsValSet[2]
+
+nombre_jugador2a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador2a, "first_name"]))
+
+apellido_jugador2a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador2a, "last_name"]))
+
+equipo_jugador2a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador2a, "current_club_name"]))
+equipo_jugador2a
+
+cat("El segundo jugador es", nombre_jugador2a, apellido_jugador2a)
+```
+
+```{r}
+ValSetPrueba_serie2 <- ValSet[[2]]
+ValSetPrueba2 <- list(ts(ValSetPrueba_serie2))
+
+#Distancia DTW entre la serie y los centroides
+disVal2 <- proxy::dist(ValSetPrueba2, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado2 <- which.min(disVal2)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado2), "\n") 
+
+s1_2 <- ValSetPrueba_serie2
+s2_2 <- clusterPar@centroids[[cluster_asignado2]]
+
+xrange_2 <- range(1:max(length(s1_2),length(s2_2)))
+yrange_2 <- range(c(s1_2,s2_2))
+
+plot(xrange_2, yrange_2, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1_2, col='blue', type='l')
+lines(s2_2, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw2 <- dtw(s1_2,s2_2, keep = TRUE, window.type = "sakoechiba", window.size = 14)
+disDtw2$index1
+disDtw2$index2
+
+plot(disDtw2, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw2, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie2 <-  disVal2[[cluster_asignado2]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie2))
+
+```
+
+Serie 3
+
+```{r}
+id_jugador3a <- idsValSet[3]
+
+nombre_jugador3a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador3a, "first_name"]))
+
+apellido_jugador3a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador3a, "last_name"]))
+
+equipo_jugador3a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador3a, "current_club_name"]))
+equipo_jugador3a
+
+cat("El tercer jugador es", nombre_jugador3a, apellido_jugador3a)
+```
+
+```{r}
+ValSetPrueba_serie3 <- ValSet[[3]]
+ValSetPrueba3 <- list(ts(ValSetPrueba_serie3))
+
+#Distancia DTW entre la serie y los centroides
+disVal3 <- proxy::dist(ValSetPrueba3, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado3 <- which.min(disVal3)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado3), "\n") 
+
+s1_3 <- ValSetPrueba_serie3
+s2_3 <- clusterPar@centroids[[cluster_asignado3]]
+
+xrange_3 <- range(1:max(length(s1_3),length(s2_3)))
+yrange_3 <- range(c(s1_3,s2_3))
+
+plot(xrange_3, yrange_3, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1_3, col='blue', type='l')
+lines(s2_3, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw3 <- dtw(s1_3,s2_3, keep = TRUE, window.type = "sakoechiba", window.size = 6)
+disDtw3$index1
+disDtw3$index2
+
+plot(disDtw3, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw3, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie3 <-  disVal3[[cluster_asignado3]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie3))
+
+```
+
+
+
+Serie 4
+
+```{r}
+id_jugador4a <- idsValSet[4]
+
+nombre_jugador4a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador4a, "first_name"]))
+
+apellido_jugador4a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador4a, "last_name"]))
+
+equipo_jugador4a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador4a, "current_club_name"]))
+equipo_jugador4a
+
+cat("El cuarto jugador es", nombre_jugador4a, apellido_jugador4a)
+```
+
+```{r}
+ValSetPrueba_serie4 <- ValSet[[4]]
+ValSetPrueba4 <- list(ts(ValSetPrueba_serie4))
+
+#Distancia DTW entre la serie y los centroides
+disVal4 <- proxy::dist(ValSetPrueba4, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado4 <- which.min(disVal4)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado4), "\n") 
+
+s1_4 <- ValSetPrueba_serie4
+s2_4 <- clusterPar@centroids[[cluster_asignado4]]
+
+xrange_4 <- range(1:max(length(s1_4),length(s2_4)))
+yrange_4 <- range(c(s1_4,s2_4))
+
+plot(xrange_4, yrange_4, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1_4, col='blue', type='l')
+lines(s2_4, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw4 <- dtw(s1_4,s2_4, keep = TRUE, window.type = "sakoechiba", window.size = 5)
+disDtw4$index1
+disDtw4$index2
+
+plot(disDtw4, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw4, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie4 <-  disVal4[[cluster_asignado4]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie4))
+
+```
+
+
+Serie 5
+
+```{r}
+id_jugador5a <- idsValSet[5]
+
+nombre_jugador5a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador5a, "first_name"]))
+
+apellido_jugador5a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador5a, "last_name"]))
+
+equipo_jugador5a <- as.character(unique(DatosFinal[DatosFinal$player_id == id_jugador5a, "current_club_name"]))
+equipo_jugador5a
+
+cat("El quinto jugador es", nombre_jugador5a, apellido_jugador5a)
+```
+
+```{r}
+ValSetPrueba_serie5 <- ValSet[[5]]
+ValSetPrueba5 <- list(ts(ValSetPrueba_serie5))
+
+#Distancia DTW entre la serie y los centroides
+disVal5 <- proxy::dist(ValSetPrueba5, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado5 <- which.min(disVal5)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado5), "\n") 
+
+s1_5 <- ValSetPrueba_serie5
+s2_5 <- clusterPar@centroids[[cluster_asignado5]]
+
+xrange_5 <- range(1:max(length(s1_5),length(s2_5)))
+yrange_5 <- range(c(s1_5,s2_5))
+
+plot(xrange_5, yrange_5, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1_5, col='blue', type='l')
+lines(s2_5, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw5 <- dtw(s1_5,s2_5, keep = TRUE, window.type = "sakoechiba", window.size = 15)
+disDtw5$index1
+disDtw5$index2
+
+plot(disDtw5, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw5, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie5 <-  disVal5[[cluster_asignado5]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie5))
+
+```
+
+Añadimos los datos de mercado de los jugadores de fútbol Rodri y Vinicius Junior para analizar cómo serían sus agrupamientos. Dividimos de la misma manera que antes sus observaciones semestralmente y creamos una lista con sus datos y los normalizamos.
+
+```{r}
+JugadoresAdicionales = read.csv("C:/Users/angyp/Desktop/TFG/JugadoresAdicionales.csv", sep=";", header = TRUE, dec = ".")
+```
+
+Cambiamos el formato de la columna "date" a una fecha que acepte correctamente R.
+
+```{r}
+JugadoresAdicionales$date <- as.Date(JugadoresAdicionales$date, format = "%d/%m/%Y")
+```
+
+Creamos de la misma forma que antes dos columnas nuevas, una de año y otra de semestre para indicar la fecha en la que la valoración fue realizada de manera semestral.
+
+```{r}
+SemestreAdicional <- JugadoresAdicionales %>%
+  mutate(years = year(JugadoresAdicionales$date),
+         semester = if_else(month(JugadoresAdicionales$date) <= 6, 1, 2)) %>%
+  group_by(player_id, years, semester) %>%
+  summarise(market_value_in_eur = mean(market_value_in_eur),
+            name = first(first_name),
+            first_name = first(first_name),
+            last_name = first(last_name),
+            current_club_name = first(current_club_name),
+            .groups = "drop")
+
+```
+
+Creamos una tabla con todas las combinaciones posibles de "player_id", "years" y "semester" para añadir los valores faltantes a la tabla de datos y tener la separación correcta en las series temporales.
+
+```{r}
+AnosAdicional <- SemestreAdicional %>%
+  group_by(player_id) %>%
+  summarise(MenorAno = min(years), 
+            MayorAno = max(years),
+            .groups = "drop") %>%
+  rowwise() %>%
+  mutate(yearsPosibles = list(MenorAno:MayorAno)) %>%
+  unnest(yearsPosibles) %>%
+  select(player_id, years = yearsPosibles)
+
+InicioFinAdicional <- SemestreAdicional %>%
+  group_by(player_id) %>%
+  summarise(MenorAno = min(years),
+            PrimerSemestre = first(semester),
+            MayorAno = max(years),
+            UltimoSemestre = last(semester),
+            .groups = "drop")
+
+TodosSemestresAdicional <- AnosAdicional %>%
+  crossing(semester = c(1,2)) %>%
+  left_join(InicioFinAdicional, by = "player_id") %>%
+  filter(!(years == MenorAno & semester < PrimerSemestre),
+         !(years == MayorAno & semester > UltimoSemestre)) %>%
+  select(player_id, years, semester)
+```
+
+Unimos ambas tablas con un "left join", la creada con todos los años y semestres y la de los datos de los jugadores. Añadimos los valores faltantes rellenando de los valores anteriores.
+
+```{r}
+
+DatosTodosSemestresAdicional <- TodosSemestresAdicional %>%
+  left_join(SemestreAdicional, by = c("player_id", "years", "semester")) %>%
+  arrange(player_id, years, semester) %>%
+  group_by(player_id) %>%
+  fill(market_value_in_eur, name, first_name, last_name, current_club_name, .direction = "down") %>%
+  fill(market_value_in_eur, name, first_name, last_name, current_club_name, .direction = "up") %>%
+  ungroup()
+
+```
+
+Creamos una nueva variable a la tabla de datos que una el año y el semestre.
+
+```{r}
+DatosSeriesAdicionales <- DatosTodosSemestresAdicional %>%
+  mutate(tiempo = paste0(years, ".", semester)) %>%
+  arrange(player_id, years, semester)
+```
+
+Creamos una lista con los valores de mercado de cada uno de estos jugadores.
+
+```{r}
+SeriesJugadorAdicionalesSinNormalizarAdicionales <- DatosSeriesAdicionales %>%
+  group_by(player_id) %>%
+  summarise(serie = list(market_value_in_eur),
+            .groups = "drop") %>%
+  pull(serie)
+```
+
+Creamos una lista con los identificadores de los jugadores en el mismo orden que la lista de sus valores, para poder identificar los jugadores por su posición en la lista.
+
+```{r}
+idsAdicionales <- DatosSeriesAdicionales %>%
+  distinct(player_id) %>%
+  pull(player_id) %>%
+  as.list()
+```
+
+Al igual que con los ids creamos una lista con las fechas de las valoraciones de cada jugador. Lo hacemos a partir de la nueva variable creada que tiene el año y mes de valoración.
+
+```{r}
+FechaSeriesAdicionales <- DatosSeriesAdicionales %>%
+  group_by(player_id) %>%
+  summarise(tiempo = list(tiempo),
+            .groups = "drop") %>%
+  pull(tiempo)
+```
+
+Normalizamos los datos del valor de mercado de los jugadores, para compararlos con los datos de los grupos formados los cuales también están normalizados.
+
+```{r}
+SeriesJugadorAdicionales <- zscore(SeriesJugadorAdicionalesSinNormalizarAdicionales)
+```
+
+Vemos cual sería el grupo al que pertenecen estos jugadores midiendo su similitud a los medoides de los grupos y eligiendo aquel cuya distancia DTW sea menor. Representamos la serie del jugador junto al centroide del grupo y la alineación entre ambos para analizarlo.
+
+Serie 7
+
+```{r}
+id_jugador7a <- idsAdicionales[1]
+
+nombre_jugador7a <- as.character(unique(DatosTodosSemestresAdicional[DatosTodosSemestresAdicional$player_id == id_jugador7a, "first_name"]))
+
+apellido_jugador7a <- as.character(unique(DatosTodosSemestresAdicional[DatosTodosSemestresAdicional$player_id == id_jugador7a, "last_name"]))
+
+equipo_jugador7a <- as.character(unique(DatosTodosSemestresAdicional[DatosTodosSemestresAdicional$player_id == id_jugador7a, "current_club_name"]))
+equipo_jugador7a
+
+cat("El séptimo jugador es", nombre_jugador7a, apellido_jugador7a)
+```
+
+```{r}
+ValSetPrueba_serie7 <- SeriesJugadorAdicionales[[1]]
+ValSetPrueba7 <- list(ts(ValSetPrueba_serie7))
+
+#Distancia DTW entre la serie y los centroides
+disVal7 <- proxy::dist(ValSetPrueba7, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado7 <- which.min(disVal7)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado7), "\n") 
+
+s1_7 <- ValSetPrueba_serie7
+s2_7 <- clusterPar@centroids[[cluster_asignado7]]
+
+xrange_7 <- range(1:max(length(s1_7),length(s2_7)))
+yrange_7 <- range(c(s1_7,s2_7))
+
+plot(xrange_7, yrange_7, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1_7, col='blue', type='l')
+lines(s2_7, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw7 <- dtw(s1_7,s2_7, keep = TRUE, window.type = "sakoechiba", window.size = 15)
+disDtw7$index1
+disDtw7$index2
+
+plot(disDtw7, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw7, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie7 <-  disVal7[[cluster_asignado7]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie7))
+
+```
+
+Serie 8
+
+```{r}
+id_jugador8a <- idsAdicionales[2]
+
+nombre_jugador8a <- as.character(unique(DatosTodosSemestresAdicional[DatosTodosSemestresAdicional$player_id == id_jugador8a, "first_name"]))
+
+apellido_jugador8a <- as.character(unique(DatosTodosSemestresAdicional[DatosTodosSemestresAdicional$player_id == id_jugador8a, "last_name"]))
+
+equipo_jugador8a <- as.character(unique(DatosTodosSemestresAdicional[DatosTodosSemestresAdicional$player_id == id_jugador8a, "current_club_name"]))
+equipo_jugador8a
+
+cat("El octavo jugador es", apellido_jugador8a)
+```
+
+```{r}
+ValSetPrueba_serie8 <- SeriesJugadorAdicionales[[2]]
+ValSetPrueba8 <- list(ts(ValSetPrueba_serie8))
+
+#Distancia DTW entre la serie y los centroides
+disVal8 <- proxy::dist(ValSetPrueba8, clusterPar@centroids, method = "dtw", args = tsclust_args(dist = list(window.size = 5)))
+
+cluster_asignado8 <- which.min(disVal8)
+cat("La serie se asigna al clúster número", as.numeric(cluster_asignado8), "\n") 
+
+s1_8 <- ValSetPrueba_serie8
+s2_8 <- clusterPar@centroids[[cluster_asignado8]]
+
+xrange_8 <- range(1:max(length(s1_8),length(s2_8)))
+yrange_8 <- range(c(s1_8,s2_8))
+
+plot(xrange_8, yrange_8, type="n", xlab="time",
+     ylab="value", xaxp  = c(0,35,35), yaxp  = c(0,35,35)) 
+lines(s1_8, col='blue', type='l')
+lines(s2_8, col='red', type='l')
+
+cat("La alineación de la serie con el centroide es la siguiente:", "\n")
+
+disDtw8 <- dtw(s1_8,s2_8, keep = TRUE, window.type = "sakoechiba", window.size = 15)
+disDtw8$index1
+disDtw8$index2
+
+plot(disDtw8, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="threeway")
+
+plot(disDtw8, xaxp  = c(0,35,35), yaxp = c(0,35,35), type="twoway", col=c('blue', 'red'))
+
+
+disDTW_serie8 <-  disVal8[[cluster_asignado8]]
+
+cat("La distancia entre las series es:", as.numeric(disDTW_serie8))
+
+```
+
+
