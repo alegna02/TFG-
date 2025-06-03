@@ -1,1 +1,1 @@
-
+Este repositorio contiene el código desarrollado para el Trabajo de Fin de Grado del grado de Matemáticas de Ángela Paredes Gómez. El proyecto se centra en la agrupación de series temporales que representan la evolución del valor de mercado de jugadores de fútbol profesionales. Se utiliza la técnica Dynamic Time Warping (DTW) para medir la similitud entre series y realizar los agrupamientos. El código está escrito en R e incluye la preparación de los datos y el análisis y visualización de los resultados.
